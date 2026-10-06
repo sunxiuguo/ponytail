@@ -1,0 +1,109 @@
+name: Verify hook stdout fix (fork only)
+
+on:
+  push:
+    branches: [ci/verify-hook-stdout-1043]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['22', '24', '26']
+    steps:
+      - name: Checkout exact reviewed patch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: 1a252c65695fbf63064a269d8367fc8942064b56
+          path: fixed
+          persist-credentials: false
+      - name: Checkout exact unchanged baseline
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: 552acd5efd0aeae2583a12efe39373d2f076f25e
+          path: baseline
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Install existing test dependency
+        run: python -m pip install pandas==2.2.3
+      - name: Runtime versions
+        run: |
+          node --version
+          python --version
+          node -p "JSON.stringify({platform:process.platform,arch:process.arch,release:require('os').release()})"
+      - name: Original small-payload reproduction before and after
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess, tempfile
+          failed = False
+          for checkout in ('baseline', 'fixed'):
+              root = pathlib.Path(checkout).resolve()
+              with tempfile.TemporaryDirectory(prefix='ponytail-small-pipe-') as home:
+                  env = {k:v for k,v in os.environ.items() if not k.startswith(('PONYTAIL_', 'CLAUDE_', 'CURSOR_', 'COPILOT_', 'CODEBUDDY_', 'QODER_'))}
+                  env.update(HOME=home, USERPROFILE=home, PLUGIN_DATA=home, CLAUDE_CONFIG_DIR=home, XDG_CONFIG_HOME=home, CLAUDE_PROJECT_DIR=str(root), PONYTAIL_DEFAULT_MODE='full')
+                  for script, payload in (('ponytail-activate.js',''), ('ponytail-mode-tracker.js','{"prompt":"/ponytail lite"}'), ('ponytail-subagent.js','{"agent_type":"general"}')):
+                      result = subprocess.run(['node',str(root/'hooks'/script)],env=env,input=payload,text=True,capture_output=True,timeout=5)
+                      try:
+                          context = json.loads(result.stdout)['hookSpecificOutput']['additionalContext']
+                          valid = True
+                      except (ValueError, KeyError):
+                          context, valid = '', False
+                      row = dict(checkout=checkout,hook=script,exit=result.returncode,bytes=len(result.stdout.encode()),valid_json=valid,context_chars=len(context),stderr=result.stderr)
+                      print(json.dumps(row),flush=True)
+                      if checkout == 'fixed' and (result.returncode or not valid): failed = True
+          if failed: raise SystemExit('Patched small-payload reproduction failed')
+      - name: Baseline npm test (failure retained for comparison)
+        id: baseline_full
+        continue-on-error: true
+        working-directory: baseline
+        run: npm test
+      - name: Patched focused regression tests
+        if: ${{ always() }}
+        working-directory: fixed
+        run: node --test tests/hooks-output.test.js
+      - name: Patched npm test
+        id: fixed_full
+        if: ${{ always() }}
+        working-directory: fixed
+        run: npm test
+      - name: Patched Pi tests (also run if root baseline fails)
+        if: ${{ always() }}
+        working-directory: fixed/pi-extension
+        run: npm test
+      - name: Rule copy and version checks
+        if: ${{ always() }}
+        working-directory: fixed
+        run: |
+          node scripts/check-rule-copies.js
+          node scripts/check-versions.js
+      - name: New regression tests on original hooks (expected POSIX failures)
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: python
+        run: |
+          import pathlib, shutil, subprocess
+          shutil.copyfile('fixed/tests/hooks-output.test.js','baseline/tests/hooks-output.test.js')
+          raise SystemExit(subprocess.call(['node','--test','tests/hooks-output.test.js'],cwd='baseline'))
+      - name: Explain baseline comparison
+        if: ${{ always() }}
+        shell: python
+        env:
+          BASELINE: ${{ steps.baseline_full.outcome }}
+          FIXED: ${{ steps.fixed_full.outcome }}
+        run: |
+          import os
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as out:
+              out.write('Baseline npm test: '+os.environ['BASELINE']+'\n\nPatched npm test: '+os.environ['FIXED']+'\n\n')
+              out.write('Failures remain visible. A matching Windows statusline-path failure must be verified against the baseline and upstream #1046; this workflow does not suppress it. No live-host installation or model calls. The workflow is confined to the fork verification branch.\n')
